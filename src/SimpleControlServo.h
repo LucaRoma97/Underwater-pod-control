@@ -350,11 +350,9 @@ void write_outputs(){
 
   if (chGrasping_value > 1600){
     digitalWrite(GrasperPin,HIGH);
-    delay(100);
   }
   else{
     digitalWrite(GrasperPin,LOW);
-    delay(100);
   }
   digitalWrite(PumpDownPin,PumpDownRate);
 }
