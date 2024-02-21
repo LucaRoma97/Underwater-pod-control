@@ -2,6 +2,10 @@
 #define DEBUG
 #include <PPMReader.h>
 #define DATA_ON_SD 26
+#include <Arduino.h>
+#include <Servo.h>
+#include <Wire.h>
+#include <SD.h>
 
 #include "Adafruit_AHRS_Mahony.h"
 #include "Adafruit_AHRS_Madgwick.h"
@@ -375,3 +379,14 @@ void RC_2_control(){
 void read_IMU(){
   
 }
+
+void print_to_serial(){
+  Serial.println(forwardRate);
+  Serial.println(chPitch_value);
+  Serial.println(chBuoyancy_value);
+  Serial.println(chThrottle_value);
+  Serial.println(chTurn_value);
+  Serial.println(Windingval);
+  Serial.println(chGrasping_value);
+}
+  
