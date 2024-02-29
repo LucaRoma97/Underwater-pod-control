@@ -6,6 +6,11 @@
 #include <Servo.h>
 #include <Wire.h>
 #include <SD.h>
+#include <Wire.h>
+
+// MS5837_30BA01 I2C address is 0x76(108)
+#define Addr 0x76
+//#include "MS5837.h"
 
 #include "Adafruit_AHRS_Mahony.h"
 #include "Adafruit_AHRS_Madgwick.h"
@@ -13,6 +18,9 @@
 #include <Arduino_BMI270_BMM150.h>
 #include <Wire.h>
 
+/// Depth Sensor ///
+unsigned long Coff[6], Ti = 0, offi = 0, sensi = 0;
+unsigned int data[3];
 
 /// IMU ///
 class MyBoschSensor : public BoschSensorClass {
@@ -98,11 +106,18 @@ float accelX, accelY, accelZ,          // units m/s/s i.e. accelZ if often 9.8 (
 
 long lastInterval, lastTime, a;
 
+float depth;
+float desired_depth;
+float desired_pitch;
+float desired_yaw;
+int _depth_control = 90;
+
 void readIMU() {
    myIMU.readAcceleration(accelX, accelY, accelZ);
    myIMU.readGyroscope(gyroX, gyroY, gyroZ);
    myIMU.readMagneticField(magX, magY, magZ);
   };
+
 void calibrateIMU(int delayMillis, int calibrationMillis) {
 
   int calibrationCount = 0;
@@ -160,14 +175,11 @@ int degreesX = 0;
 int degreesY = 0;
 int degreesZ = 0;
 
-int ServoPos;
 int PumpLeftRate;
 int PumpRightRate;
 int PumpUpRate;
 int PumpDownRate;
-int TurnRate;
-int PitchRate;
-int forwardRate;
+float forwardRate;
 int Windingval;
 
 int ServoPin = 10;
@@ -194,6 +206,36 @@ float roll;
 float pitch;
 float heading;
 
+class PIDController {
+private:
+    double Kp; // Proportional gain
+    double Ki; // Integral gain
+    double Kd; // Derivative gain
+    double prev_error;
+    double integral;
+
+public:
+    PIDController(double _Kp, double _Ki, double _Kd) : Kp(_Kp), Ki(_Ki), Kd(_Kd), prev_error(0), integral(0) {}
+
+    double compute(double setpoint, double measured_value) {
+        double error = setpoint - measured_value;
+
+        // Proportional term
+        double P = Kp * error;
+
+        // Integral term
+        integral += error;
+        double I = Ki * integral;
+
+        // Derivative term
+        double D = Kd * (error - prev_error);
+        prev_error = error;
+
+        // Total control signal
+        double control_signal = P + I + D;
+        return control_signal;
+    }
+};
 
 int getOutputSignal(int max_in, int max_out, int min_in, int min_out, int value){
   int x = ((max_out-min_out)*value+(min_out*max_in-min_in*max_out))/(max_in-min_in);
@@ -207,11 +249,38 @@ void initialize_outputs(){
   pinMode(PumpDownPin, OUTPUT);
   pinMode(GrasperPin, OUTPUT);
   pinMode(WindingPin, OUTPUT);
-  ServoPos = 90;
+  desired_depth = 0;
   servo_buoy.attach(ServoPin);
   servo_wind.attach(WindingPin);
 }
 
+void initialize_depth(){
+    Wire.begin();     
+     // Read cofficients values stored in EPROM of the device
+  for(int i = 0; i < 6; i++)
+  {
+    // Start I2C Transmission
+    Wire.beginTransmission(Addr);
+    // Select data register
+    Wire.write(0xA2 + (2 * i));
+    // Stop I2C Transmission
+    Wire.endTransmission();
+  
+    // Request 2 bytes of data
+    Wire.requestFrom(Addr, 2);
+      
+    // Read 2 bytes of data
+    // Coff msb, Coff lsb
+    if(Wire.available() == 2)
+    {
+      data[0] = Wire.read();
+      data[1] = Wire.read();
+    }  
+      
+    // Convert the data
+    Coff[i] = ((data[0] * 256) + data[1]);
+  } 
+}
 
 void initialize_SD(){
   if (!SD.begin(chipSelect)) {
@@ -250,7 +319,7 @@ void read_RC(){
 
 void save_SD(){
   String dataString = "";
-  float data_SD[DATA_ON_SD] = {forwardRate, Windingval, chPitch_value, chBuoyancy_value, chThrottle_value, chTurn_value, chTurn_value, chGrasping_value, PumpLeftRate, PumpRightRate, PumpUpRate, PumpDownRate, ServoPos, GrasperPin, degreesX, degreesY, degreesZ}; //add IMU
+  float data_SD[DATA_ON_SD] = {forwardRate, Windingval, chPitch_value, chBuoyancy_value, chThrottle_value, chTurn_value, chTurn_value, chGrasping_value, PumpLeftRate, PumpRightRate, PumpUpRate, PumpDownRate, GrasperPin, degreesX, degreesY, degreesZ}; //add IMU
   for (int counter = 0; counter < DATA_ON_SD; counter++) {
     dataString += String(data_SD[counter]);
     if (counter < DATA_ON_SD-1) {
@@ -314,12 +383,129 @@ void get_IMU(){
   }
 }
 
-void get_pumps_out(){
-  PumpLeftRate = TurnRate;
-  PumpRightRate = -TurnRate;
+void get_depth(){
 
-  PumpUpRate = PitchRate;
-  PumpDownRate = -PitchRate;
+  // Start I2C Transmission
+  Wire.beginTransmission(Addr);
+  // Send reset command 
+  Wire.write(0x1E);
+  // Stop I2C Transmission
+  Wire.endTransmission();
+  delay(1);
+  
+  // Start I2C Transmission
+  Wire.beginTransmission(Addr);
+  // Refresh pressure with the OSR = 256 
+  Wire.write(0x40);
+  // Stop I2C Transmission
+  Wire.endTransmission();
+  delay(1);
+  
+  // Start I2C Transmission
+  Wire.beginTransmission(Addr);
+  // Select data register 
+  Wire.write(0x00);
+  // Stop I2C Transmission
+  Wire.endTransmission();
+  
+  // Request 3 bytes of data
+  Wire.requestFrom(Addr, 3);
+
+  // Read 3 bytes of data
+  // ptemp_msb1, ptemp_msb, ptemp_lsb
+  if(Wire.available() == 3)
+  {
+     data[0] = Wire.read();
+     data[1] = Wire.read();
+     data[2] = Wire.read();
+  }   
+  
+  // Convert the data 
+  unsigned long ptemp = ((data[0] * 65536.0) + (data[1] * 256.0) + data[2]);
+  
+  // Start I2C Transmission
+  Wire.beginTransmission(Addr);
+  // Refresh temperature with the OSR = 256 
+  Wire.write(0x50);
+  // Stop I2C Transmission
+  Wire.endTransmission();
+  delay(1);
+  
+  // Start I2C Transmission
+  Wire.beginTransmission(Addr);
+  // Select data register
+  Wire.write(0x00);
+  // Stop I2C Transmission
+  Wire.endTransmission();
+  
+  // Request 3 bytes of data
+  Wire.requestFrom(Addr, 3);
+
+  // Read 3 bytes of data
+  // temp_msb1, temp_msb, temp_lsb
+  if(Wire.available() == 3)
+  {
+     data[0] = Wire.read();
+     data[1] = Wire.read();
+     data[2] = Wire.read();
+  }
+  
+  // Convert the data
+  unsigned long temp = ((data[0] * 65536.0) + (data[1] * 256.0) + data[2]);
+  
+  // Pressure and Temperature Calculations
+  // 1st order temperature and pressure compensation
+  // Difference between actual and reference temperature
+  unsigned long dT = temp - ((Coff[4] * 256));
+  temp = 2000 + (dT * (Coff[5] / pow(2, 23)));
+  
+  // Offset and Sensitivity calculation
+  unsigned long long off = Coff[1] *  65536 + (Coff[3] * dT) / 128;
+  unsigned long long sens = Coff[0] * 32768 + (Coff[2] * dT) / 256;
+
+  // 2nd order temperature and pressure compensation
+  if(temp >= 2000)
+  {
+     Ti = 2 * ((dT * dT) / pow(2,37));
+     offi = ((temp - 2000) * (temp - 2000)) / 16;
+     sensi = 0;
+  }
+  else if(temp < 2000)
+  {
+    Ti = 3 * ((dT * dT) / (pow(2,33)));
+    offi = 3 * ((pow((temp - 2000), 2))) / 2;
+    sensi = 5 * ((pow((temp - 2000),2))) / 8;
+     if(temp < - 1500)
+  {
+     offi = offi + 7 * ((pow((temp + 1500), 2)));
+     sensi = sensi + 4 * ((pow((temp + 1500), 2))) ;
+  }
+  }
+  
+  // Adjust temp, off, sens based on 2nd order compensation   
+  temp -= Ti;
+  off -= offi;
+  sens -= sensi;
+
+  // Convert the final data
+  ptemp = (((ptemp * sens) / 2097152) - off);
+  ptemp /= 8192;
+  float pressure = ptemp / 10.0;
+  depth = (pressure - 936)/100; // 936 mbar is atmoshperic pressure
+
+  // Output data to serial monitor
+  Serial.print("Pressure : ");
+  Serial.print(pressure);
+  Serial.println(" mbar"); 
+}
+
+void get_pumps_out(){
+  
+  //PumpLeftRate = TurnRate;
+ // PumpRightRate = -TurnRate;
+
+  PumpUpRate = desired_pitch;
+  PumpDownRate = -desired_pitch;
 
   if(forwardRate>=0){
     PumpLeftRate = PumpLeftRate+forwardRate;
@@ -340,45 +526,47 @@ void get_pumps_out(){
   if(PumpDownRate>255){PumpDownRate=255;}
   if(PumpDownRate<0){PumpDownRate=0;}
 }
+
 void write_outputs(){
-  servo_buoy.write(ServoPos);
+  servo_buoy.write(_depth_control);
   analogWrite(PumpLeftPin,PumpLeftRate);
   analogWrite(PumpRightPin,PumpRightRate);
   analogWrite(PumpUpPin,PumpUpRate);
   analogWrite(PumpDownPin,PumpDownRate);
-  servo_wind.write(Windingval);
-
-  if (chGrasping_value > 1600){
-    digitalWrite(GrasperPin,HIGH);
-  }
-  else{
-    digitalWrite(GrasperPin,LOW);
-  }
-  digitalWrite(PumpDownPin,PumpDownRate);
+  //servo_wind.write(Windingval);
+//  if (chGrasping_value > 1600){
+//    digitalWrite(GrasperPin,HIGH);
+//  }
+//  else{
+//    digitalWrite(GrasperPin,LOW);
+//  }
+//  digitalWrite(PumpDownPin,PumpDownRate);
 }
 
 void RC_2_control(){
-  int ServoRate; 
+  float ServoRate; 
   if ((chBuoyancy_value) < 1400 || (chBuoyancy_value) > 1600){
-    ServoRate = getOutputSignal(chBuoyancy_max, 50, chBuoyancy_min, -50, chBuoyancy_value);
+    ServoRate = map(chBuoyancy_value, chBuoyancy_min, chBuoyancy_max, -0.02, 0.02);
+    //getOutputSignal(chBuoyancy_max, 0.02, chBuoyancy_min, -0.02, chBuoyancy_value);
   }
   //int ServoRate1 = getOutputSignal(chBuoyancy_max, 50, chBuoyancy_min, -50, chGrasping_value);
 
-  ServoPos = ServoPos+ServoRate;
-  if (ServoPos>179){ServoPos=185;}
-  else if(ServoPos<3){ServoPos=-5;}
+  desired_depth = desired_depth+ServoRate;
+
+  if (desired_depth>0.3){desired_depth=0.3;}
+  else if(desired_depth<0.01){desired_depth=0.01;}
   
-  TurnRate = getOutputSignal(chTurn_max,255,chTurn_min,-255,chTurn_value);
-  PitchRate = getOutputSignal(chPitch_max,255,chPitch_min,-255,chPitch_value);
+  desired_yaw = getOutputSignal(chTurn_max,255,chTurn_min,-255,chTurn_value);
+  desired_pitch = getOutputSignal(chPitch_max,255,chPitch_min,-255,chPitch_value);
   forwardRate = getOutputSignal(chThrottle_max,255,chThrottle_min,0,chThrottle_value);
   Windingval = map(chWinding_value, 1000, 2000, 0, 180);
 }
 
-void read_IMU(){
-  
-}
-
 void print_to_serial(){
+  Serial.print("Depth: "); 
+  Serial.print(depth); 
+  Serial.println(" m\n");
+  Serial.print("forward, Pitch, Buoyancy, Throttle, Turn, Winding, Grasping \n "); 
   Serial.println(forwardRate);
   Serial.println(chPitch_value);
   Serial.println(chBuoyancy_value);
@@ -387,4 +575,56 @@ void print_to_serial(){
   Serial.println(Windingval);
   Serial.println(chGrasping_value);
 }
-  
+
+float depth_control(){
+  float Kp = 0.5;
+  float Ki = 0.1;
+  float Kd = 0.2;
+
+  PIDController pid(Kp, Ki, Kd);
+
+  float _depth_control = pid.compute(desired_depth, depth);
+
+  if(_depth_control>180){_depth_control = 180;}
+  if(_depth_control<0){_depth_control = 0;}
+}
+
+float pitch_control(){
+  float Kp = 0.5;
+  float Ki = 0.1;
+  float Kd = 0.2;
+
+  PIDController pid(Kp, Ki, Kd);
+
+  float pitch_control = pid.compute(desired_pitch, pitch);
+
+  float pitch_out = map(pitch_control, -40, 40, 0, 255);
+
+  PumpUpRate = pitch_out;
+  PumpDownRate = -pitch_out;
+
+  if(PumpUpRate>255){PumpUpRate = 255;}
+  if(PumpUpRate<0){PumpUpRate = 0;}
+  if(PumpDownRate>255){PumpDownRate=255;}
+  if(PumpDownRate<0){PumpDownRate=0;}
+}
+
+float yaw_control(){
+  float Kp = 0.5;
+  float Ki = 0.1;
+  float Kd = 0.2;
+
+  PIDController pid(Kp, Ki, Kd);
+
+  float yaw_control = pid.compute(desired_yaw, heading);
+
+  float yaw_out = map(yaw_control, -50, 50, 0, 255);
+
+  PumpUpRate = yaw_out + abs(forwardRate);
+  PumpDownRate = -yaw_out + abs(forwardRate);
+
+  if(PumpUpRate>255){PumpUpRate = 255;}
+  if(PumpUpRate<0){PumpUpRate = 0;}
+  if(PumpDownRate>255){PumpDownRate=255;}
+  if(PumpDownRate<0){PumpDownRate=0;}
+}
